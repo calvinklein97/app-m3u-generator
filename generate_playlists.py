@@ -358,18 +358,33 @@ def fetch_channel_list(proxy, retries=3):
             json_string = target_script[start_index:end_index]
             json_string = json_string.replace('undefined', 'null')
             json_string = re.sub(r'new Date\("([^"]*)"\)', r'"\1"', json_string)
-            return json.loads(json_string)
+            data = json.loads(json_string)
+            if isinstance(data, dict):
+                return data
         except: continue
     return []
+
+def iter_categories(node):
+    """Liefert alle Kategorie-Dicts mit einer 'contents'-Liste.
+    Tubi hat contentIdsByContainer von Dict -> Liste geaendert; diese Funktion
+    kommt mit beiden Strukturen (und weiterer Verschachtelung) zurecht."""
+    if isinstance(node, dict):
+        if isinstance(node.get('contents'), list):
+            yield node
+        else:
+            for value in node.values():
+                yield from iter_categories(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from iter_categories(item)
 
 def create_group_mapping(json_data):
     group_mapping = {}
     content_ids_by_container = json_data.get('epg', {}).get('contentIdsByContainer', {})
-    for container_list in content_ids_by_container.values():
-        for category in container_list:
-            group_name = category.get('name', 'Other')
-            for content_id in category.get('contents', []):
-                group_mapping[str(content_id)] = group_name
+    for category in iter_categories(content_ids_by_container):
+        group_name = category.get('name', 'Other')
+        for content_id in category.get('contents', []):
+            group_mapping[str(content_id)] = group_name
     return group_mapping
 
 def fetch_epg_data(channel_list):
@@ -435,13 +450,16 @@ def generate_tubi_m3u():
             json_data = fetch_channel_list(proxy)
             if json_data: break
     if not json_data: json_data = fetch_channel_list(None)
-    if not json_data: return
+    if not json_data:
+        raise RuntimeError("Tubi: Channel-Liste konnte nicht geladen werden")
 
     channel_list = []
     content_ids_by_container = json_data.get('epg', {}).get('contentIdsByContainer', {})
-    for container_list in content_ids_by_container.values():
-        for category in container_list:
-            channel_list.extend(category.get('contents', []))
+    for category in iter_categories(content_ids_by_container):
+        channel_list.extend(category.get('contents', []))
+    channel_list = list(dict.fromkeys(channel_list))
+    if not channel_list:
+        raise RuntimeError("Tubi: keine Channel-IDs in contentIdsByContainer gefunden (Struktur geaendert?)")
 
     epg_data = fetch_epg_data(channel_list)
     if epg_data:
@@ -450,14 +468,48 @@ def generate_tubi_m3u():
         epg_tree = create_epg_xml(epg_data)
         write_m3u_file("tubi_all.m3u", m3u_playlist)
         epg_tree.write(os.path.join(OUTPUT_DIR, "tubi_epg.xml"), encoding='utf-8', xml_declaration=True)
+    else:
+        raise RuntimeError("Tubi: keine EPG-Daten erhalten")
 
 # --- Execution ---
 
-if __name__ == "__main__":
-    cleanup_output_dir()
-    generate_pluto_m3u()
-    generate_plex_m3u()
-    generate_samsungtvplus_m3u()
-    generate_tubi_m3u()
-    generate_roku_m3u()
+def snapshot_output_dir():
+    snapshot = {}
+    if os.path.isdir(OUTPUT_DIR):
+        for name in os.listdir(OUTPUT_DIR):
+            path = os.path.join(OUTPUT_DIR, name)
+            if os.path.isfile(path):
+                with open(path, 'rb') as f:
+                    snapshot[name] = f.read()
+    return snapshot
 
+def restore_provider_files(snapshot, prefix):
+    """Stellt alte Dateien eines fehlgeschlagenen Anbieters wieder her,
+    damit sie nicht durch cleanup_output_dir() verloren gehen."""
+    for name, data in snapshot.items():
+        if name.startswith(prefix) and not os.path.exists(os.path.join(OUTPUT_DIR, name)):
+            with open(os.path.join(OUTPUT_DIR, name), 'wb') as f:
+                f.write(data)
+            logger.warning(f"Alte Datei wiederhergestellt: {name}")
+
+if __name__ == "__main__":
+    snapshot = snapshot_output_dir()
+    cleanup_output_dir()
+    providers = [
+        ("pluto", "plutotv_", generate_pluto_m3u),
+        ("plex", "plex_", generate_plex_m3u),
+        ("samsungtvplus", "samsungtvplus_", generate_samsungtvplus_m3u),
+        ("tubi", "tubi_", generate_tubi_m3u),
+        ("roku", "roku_", generate_roku_m3u),
+    ]
+    failed = []
+    for name, prefix, func in providers:
+        try:
+            func()
+        except Exception:
+            logger.exception(f"Anbieter '{name}' fehlgeschlagen")
+            failed.append(name)
+            restore_provider_files(snapshot, prefix)
+    if failed:
+        logger.error(f"Fehlgeschlagene Anbieter: {', '.join(failed)}")
+        raise SystemExit(1)

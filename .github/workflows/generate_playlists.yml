@@ -43,6 +43,7 @@ jobs:
         run: python generate_playlists.py
 
       - name: Fix Tubi EPG URL (The TiviMate Fix)
+        if: ${{ !cancelled() }}
         run: |
           # Dynamically builds the full URL to your XML file on GitHub
           GITHUB_RAW_URL="https://raw.githubusercontent.com/${{ github.repository }}/main/playlists/tubi_epg.xml"
@@ -55,6 +56,7 @@ jobs:
           fi
 
       - name: Commit and Push Changes
+        if: ${{ !cancelled() }}
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
